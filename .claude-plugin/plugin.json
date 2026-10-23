@@ -22,32 +22,32 @@
   "types": "./types/index.d.ts",
   "userConfig": {
     "architectPattern": {
-      "title": "Architect pattern",
-      "description": "Regular expression (case-insensitive) for the agent types and server tools that count as the on-call architect, e.g. advisor|architect|reviewer",
+      "title": "顧問比對規則",
+      "description": "不分大小寫的正規表示式，用來判斷哪些 agent 類型和伺服器端工具算「待命顧問」，例如 advisor|architect|reviewer",
       "type": "string",
       "default": "advisor|architect"
     },
     "architectLabel": {
-      "title": "Architect label",
-      "description": "Name shown for the architect role",
+      "title": "顧問名稱",
+      "description": "顧問角色顯示的名稱",
       "type": "string",
-      "default": "ARCHITECT"
+      "default": "顧問"
     },
     "gateLabel": {
-      "title": "Gate label",
-      "description": "Name shown for the permission panel",
+      "title": "權限閘名稱",
+      "description": "權限面板顯示的名稱",
       "type": "string",
-      "default": "GATE"
+      "default": "權限閘"
     },
     "panels": {
-      "title": "Panels",
-      "description": "Comma-separated panels in display order: main, architect, gate, agents, loops, receipt, log. Leave one out to hide it.",
+      "title": "面板",
+      "description": "以逗號分隔的面板順序：main、architect、gate、agents、loops、receipt、log。省略某一項就會隱藏它。",
       "type": "string",
       "default": "main,architect,gate,agents,loops,receipt,log"
     },
     "motion": {
-      "title": "Motion",
-      "description": "Animate the connectors while real work flows, or keep them still",
+      "title": "動畫",
+      "description": "工作時讓連接線動起來，或保持靜止",
       "type": "string",
       "options": [
         "while-active",
@@ -56,26 +56,26 @@
       "default": "while-active"
     },
     "moments": {
-      "title": "Architect moments",
-      "description": "Show the inferred moment of each consult (before a plan, error repeats, before done)",
+      "title": "顧問時機",
+      "description": "顯示每次諮詢的推測時機（寫計畫前、錯誤重複、完成前）",
       "type": "boolean",
       "default": true
     },
     "matchDescriptions": {
-      "title": "Match agent descriptions",
-      "description": "Also count an agent type as the architect when its description (not just its name) matches the pattern",
+      "title": "比對 agent 描述",
+      "description": "除了名稱，agent 的描述符合規則時，也把該類型算成顧問",
       "type": "boolean",
       "default": false
     },
     "maxCards": {
-      "title": "Cards before swimlanes",
-      "description": "Agent cards drawn side by side; more agents than this switch to swimlanes (1-6)",
+      "title": "卡片數上限",
+      "description": "並排顯示的 agent 卡片數；超過這個數量就改用時間軸（1-6）",
       "type": "number",
       "default": 3
     },
     "layout": {
-      "title": "Layout",
-      "description": "auto: a summary of at most 8 rows when the pane sits inline above the prompt, two columns from 110 columns when docked, one column otherwise",
+      "title": "版面",
+      "description": "auto：放在輸入框上方時是最多 8 行的摘要；停靠在旁邊時 110 欄以上為兩欄，否則一欄",
       "type": "string",
       "options": [
         "auto",
@@ -86,8 +86,8 @@
       "default": "auto"
     },
     "palette": {
-      "title": "Palette",
-      "description": "theme follows your Claude Code theme (light, dark, colour-blind); pastel is fixed colours tuned for dark terminals",
+      "title": "配色",
+      "description": "theme 跟隨你的 Claude Code 主題（淺色、深色、色盲友善）；pastel 是為深色終端機調過的固定粉彩色",
       "type": "string",
       "options": [
         "theme",
@@ -96,14 +96,14 @@
       "default": "theme"
     },
     "openOnStart": {
-      "title": "Open on start",
-      "description": "Open the pane when a session starts",
+      "title": "啟動時開啟",
+      "description": "開始 session 時自動開啟面板",
       "type": "boolean",
       "default": true
     },
     "statusLine": {
-      "title": "Status line",
-      "description": "Show context, agents, consults and denials in the status line",
+      "title": "狀態列",
+      "description": "在狀態列顯示上下文、agent、諮詢與被拒絕的次數",
       "type": "boolean",
       "default": true
     }
