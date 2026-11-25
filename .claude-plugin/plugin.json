@@ -1,6 +1,6 @@
 {
   "name": "flightdeck",
-  "version": "0.4.0",
+  "version": "0.6.2",
   "description": "Flightdeck: a live agent dashboard for Claude Code. Main model vitals, an on-call architect, every permission check, subagent cards and swimlanes, a turn receipt and a session log, all from real session events",
   "author": {
     "name": "Stephen Casella",
@@ -72,6 +72,12 @@
       "description": "並排顯示的 agent 卡片數；超過這個數量就改用時間軸（1-6）",
       "type": "number",
       "default": 3
+    },
+    "paneColumns": {
+      "title": "面板寬度",
+      "description": "面板停靠在全螢幕對話旁時要求的欄數,至少 40。Claude Code 最多讓停靠區佔終端機的 45%,你拖曳調整過的寬度優先。",
+      "type": "number",
+      "default": 66
     },
     "layout": {
       "title": "版面",

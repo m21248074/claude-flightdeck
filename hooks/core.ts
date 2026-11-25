@@ -30,10 +30,16 @@ export const DEFAULT_USAGE: Usage = {
   pct: null,
   tokens: null,
   window: 0,
+  compactWindow: null,
+  compactFor: 0,
+  compactMisses: 0,
   costUsd: null,
   limits: [],
   compactions: 0,
   lastCompactAt: null,
+  isCompactEstimate: false,
+  isCompactHooked: false,
+  hasFill: false,
 }
 export const DEFAULT_ARCHITECT: Architect = { consults: [], ids: [], seen: [], lastAdvice: '' }
 const ZERO: Tally = { rule: 0, ask: 0, cleared: 0, deny: 0 }
@@ -103,6 +109,7 @@ export type Config = {
   moments: boolean
   matchDescriptions: boolean
   maxCards: number
+  paneColumns: number
   layout: Layout
   palette: Palette
   openOnStart: boolean
@@ -127,6 +134,7 @@ export const parseConfig = (o: Readonly<Record<string, unknown>>): Config => {
     .filter((p): p is Panel => (PANELS as readonly string[]).includes(p))
   const layout = str('layout', 'auto')
   const max = typeof o.maxCards === 'number' ? Math.round(o.maxCards) : 3
+  const cols = typeof o.paneColumns === 'number' && Number.isFinite(o.paneColumns) ? Math.round(o.paneColumns) : 66
   return {
     architect: safeRegExp(str('architectPattern', ''), 'advisor|architect'),
     architectLabel: str('architectLabel', '顧問'),
@@ -136,6 +144,8 @@ export const parseConfig = (o: Readonly<Record<string, unknown>>): Config => {
     moments: bool('moments', true),
     matchDescriptions: bool('matchDescriptions', false),
     maxCards: Math.min(6, Math.max(1, max)),
+    // The body clamps its drawing at 40 columns, so a narrower dock would only clip it.
+    paneColumns: Math.max(40, cols),
     layout: layout === 'compact' || layout === 'wide' || layout === 'mini' ? layout : 'auto',
     palette: str('palette', 'theme') === 'pastel' ? 'pastel' : 'theme',
     openOnStart: bool('openOnStart', true),
@@ -201,8 +211,19 @@ export const prettyModel = (id: string) => {
   return shorten(id, 22)
 }
 
+/**
+ * Text with its control bytes taken out (ESC, the 8-bit CSI and the rest of C0 and C1), so a tool's or an
+ * agent's text can't move the cursor or restyle the pane. Tab and newline stay; a carriage return becomes a
+ * newline, and a vertical tab or form feed a space.
+ */
+export const stripControl = (s: string) =>
+  s
+    .replace(/\r\n?/g, '\n')
+    .replace(/[\v\f]/g, ' ')
+    .replace(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/g, '')
+
 export const shorten = (s: string, n: number) => {
-  const one = s.replace(/\s+/g, ' ').trim()
+  const one = stripControl(s).replace(/\s+/g, ' ').trim()
   return n <= 0 ? '' : one.length > n ? `${one.slice(0, Math.max(0, n - 1)).trimEnd()}…` : one
 }
 
@@ -231,22 +252,90 @@ export const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? '' :
 export const fmtUsd = (n: number) => (n >= 100 ? `$${Math.round(n)}` : `$${n.toFixed(2)}`)
 
 /**
- * How fast a request answered, from three readings of the clock: when it was sent, when its first
- * piece of response arrived, and when it stopped. Null when no response came. `tokPerS` is null
- * when there is no usage or no time between the first piece and the stop to divide by.
+ * How soon a request began to answer: from when it was sent to its first piece of response; null when
+ * none came. No output rate: the reported tokens include thinking, which may arrive unstreamed before
+ * that first piece, so tokens over the visible stream read in the thousands per second.
  */
-export const stepSpeed = (sentAt: number, firstAt: number | null, stopAt: number, outTokens: number | null) => {
-  if (firstAt === null) return null
-  const decodeMs = stopAt - firstAt
+export const stepSpeed = (sentAt: number, firstAt: number | null) => (firstAt === null ? null : { ttftMs: Math.max(0, firstAt - sentAt) })
+
+/** `ttft 0.8s`. */
+export const fmtSpeed = (s: { ttftMs: number }) => `ttft ${(s.ttftMs / 1000).toFixed(1)}s`
+
+/** The compaction window a context breakdown reports: its `rawMaxTokens` when auto-compaction is on and that is smaller than the model's `window`; else null. */
+export const compactWindowOf = (b: { rawMaxTokens: number; isAutoCompactEnabled: boolean } | null | undefined, window: number): number | null =>
+  b && b.isAutoCompactEnabled && b.rawMaxTokens > 0 && b.rawMaxTokens < window ? b.rawMaxTokens : null
+
+/**
+ * What the context gauge measures: the compaction window when one is set smaller than the model's,
+ * else the model's window, and the fill of it from the real `tokens` reading. No gauge (null) without one.
+ */
+export const contextFill = (u: Pick<Usage, 'tokens' | 'window' | 'compactWindow'>): { pct: number | null; window: number } => {
+  const window = u.compactWindow !== null && u.compactWindow > 0 && u.compactWindow < u.window ? u.compactWindow : u.window
+  return { window, pct: u.tokens !== null && window > 0 ? (u.tokens * 100) / window : null }
+}
+
+/** Reads of the compaction window that may miss (no session bound yet) before a model window stops asking. */
+export const COMPACT_TRIES = 3
+
+/**
+ * A measurement of model window `window`: whether it reads the compaction window (not read for this
+ * window yet, fewer than COMPACT_TRIES misses), and the usage with that read claimed. A new window
+ * starts its misses afresh.
+ */
+export const claimCompactRead = (u: Usage, window: number): { usage: Usage; isClaimed: boolean } => {
+  const misses = u.window === window ? u.compactMisses : 0
+  const isClaimed = window > 0 && u.compactFor !== window && misses < COMPACT_TRIES
+  return { usage: { ...u, compactFor: isClaimed ? window : u.compactFor, compactMisses: misses }, isClaimed }
+}
+
+/**
+ * The usage after a compaction-window read for model window `window`. Dropped when a newer claim took
+ * its place (a model switch); a read that failed or came back with no breakdown is a miss, asked
+ * again at the next measurement.
+ */
+export const afterCompactRead = (
+  u: Usage,
+  window: number,
+  b: { rawMaxTokens: number; isAutoCompactEnabled: boolean } | null | undefined,
+): Usage =>
+  u.compactFor !== window
+    ? u
+    : b
+      ? { ...u, compactWindow: compactWindowOf(b, window), compactMisses: 0 }
+      : { ...u, compactWindow: null, compactFor: 0, compactMisses: u.compactMisses + 1 }
+
+/** A new main-loop model may compact in another window (`modelSettings`): read afresh at the next measurement. */
+export const forgetCompactRead = (u: Usage): Usage => ({ ...u, compactWindow: null, compactFor: 0, compactMisses: 0 })
+
+/**
+ * A main-loop request about to go out, and whether `$.session.usage()` reports a fill for it. Claude Code
+ * reports none until the first response after a new session, a /clear or a compaction. So no fill after a
+ * response came back means the context was compacted (a /clear resets `hasFill` before this). It counts as an
+ * estimate, and only until session.compact reaches Flightdeck, whose count is the real one.
+ */
+export const afterFillRead = (u: Usage, hasFill: boolean, now: number): { usage: Usage; isCompaction: boolean } => {
+  if (hasFill) return { usage: u.hasFill ? u : { ...u, hasFill: true }, isCompaction: false }
+  if (!u.hasFill) return { usage: u, isCompaction: false }
+  if (u.isCompactHooked) return { usage: { ...u, hasFill: false }, isCompaction: false }
   return {
-    ttftMs: Math.max(0, firstAt - sentAt),
-    tokPerS: outTokens !== null && outTokens > 0 && decodeMs > 0 ? (outTokens * 1000) / decodeMs : null,
+    usage: { ...u, hasFill: false, compactions: u.compactions + 1, lastCompactAt: now, isCompactEstimate: true },
+    isCompaction: true,
   }
 }
 
-/** `ttft 0.8s · 42 tok/s`; the rate is left off when it is unknown. */
-export const fmtSpeed = (s: { ttftMs: number; tokPerS: number | null }) =>
-  `ttft ${(s.ttftMs / 1000).toFixed(1)}s` + (s.tokPerS !== null ? ` · ${Math.round(s.tokPerS)} tok/s` : '')
+/** A main-loop response came back: the context has a fill until the next compaction. */
+export const afterResponse = (u: Usage): Usage => (u.hasFill ? u : { ...u, hasFill: true })
+
+/**
+ * session.compact reached Flightdeck, so the guard isn't in the way and every compaction will reach it.
+ * An estimate made before it was something else (a rewind to the first prompt reads the same): dropped.
+ */
+export const afterCompactHooked = (u: Usage): Usage =>
+  u.isCompactHooked ? u : { ...u, isCompactHooked: true, ...(u.isCompactEstimate ? { compactions: 0, lastCompactAt: null, isCompactEstimate: false } : {}) }
+
+/** The compaction count as the pane marks it: `⟲2`, or `⟲~2` when estimated; empty before the first. */
+export const compactMark = (u: Pick<Usage, 'compactions' | 'isCompactEstimate'>) =>
+  u.compactions > 0 ? `⟲${u.isCompactEstimate ? '~' : ''}${u.compactions}` : ''
 
 /** A gauge of `width` cells: ▰ filled, ▱ empty. */
 export const gauge = (pct: number, width: number) => {
@@ -280,14 +369,26 @@ export const limitLabel = (kind: string) =>
 
 // ---------------------------------------------------------------- redaction
 
+// Each pattern runs in time linear in its input: redact sees whole commands, prompts and answers before
+// they are cut, inside hooks a tool call waits on. A pattern that can start at many points of one run of
+// characters and scan to the run's end each time (`\b` before a class that holds `-` or `.`) is quadratic.
 const SECRETS: [RegExp, string][] = [
+  [/-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z ]*PRIVATE KEY-----|$)/g, '•••'],
   [/(authorization\s*[:=]\s*)(bearer\s+|basic\s+)?\S+/gi, '$1$2•••'],
   [/\b(bearer)\s+[A-Za-z0-9._~+/-]{8,}=*/gi, '$1 •••'],
-  [/\b(sk|pk|rk|ghp|gho|ghs|github_pat|xox[abprs])[-_][A-Za-z0-9_-]{8,}/g, '•••'],
-  [/((?:api[_-]?key|access[_-]?token|token|secret|password|passwd|pwd)\s*[=:]\s*)("[^"]*"|'[^']*'|\S+)/gi, '$1•••'],
-  [/(--(?:token|password|api-key|secret)[= ])\S+/gi, '$1•••'],
+  [/\b(sk|pk|rk|ghp|gho|ghs|ghu|ghr|github_pat|xox[abprs])[-_][A-Za-z0-9_-]{8,}/g, '•••'],
+  [/\b(?:AKIA|ASIA)[A-Z0-9]{16}\b/g, '•••'],
+  [/\bAIza[0-9A-Za-z_-]{35}/g, '•••'],
+  // A JWT: three base64url parts, the first a JSON header. Not `\b`: that would start at each `eyJ` after a `-`.
+  [/(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]+/g, '•••'],
+  [/\bATATT[A-Za-z0-9_=-]{10,}/g, '•••'],
+  // The quote a key may end on is JSON's: {"password":"x"}. An unquoted value runs to whitespace, commas and all.
+  [/((?:api[_-]?key|access[_-]?token|token|secret|password|passwd|pwd)["']?\s*[=:]\s*)("[^"]*"|'[^']*'|\S+)/gi, '$1•••'],
+  [/(--(?:token|password|api-key|secret)[= ])("[^"]*"|'[^']*'|\S+)/gi, '$1•••'],
   [/(\b[A-Z][A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD)=)\S+/g, '$1•••'],
-  [/(\b[a-z][a-z0-9+.-]*:\/\/[^\s/:@]+:)[^\s@]+@/gi, '$1•••@'],
+  // The password of a URL's user, any scheme, `/` and all (an AWS secret key has them). It ends before the
+  // next `://`, so a try started at one `://` never scans past another.
+  [/(:\/\/[^\s/:@]+:)(?:(?!:\/\/)[^\s@])+@/g, '$1•••@'],
 ]
 
 /** What the gate drill-down may store: credentials masked before anything is written to state. */
@@ -437,6 +538,39 @@ export const applyStep = (c: AgentCard, s: { model: string; usage: StepUsage; st
 
 export const noteTool = (c: AgentCard, n: ToolNote): AgentCard => ({ ...c, tools: [...c.tools, n].slice(-3) })
 
+/** A surface module's fault key, `desktop:rail.tsx`, from `hooks/rail.tsx` or `hooks\rail.tsx` alike. */
+export const faultKey = (surface: string, module: string) => `${surface}:${module.split(/[\\/]/).pop()}`
+
+/** The first Claude Code release whose `Text` takes `mono`, the surface's monospaced face. */
+export const MONO_SINCE = [2, 1, 299] as const
+
+/**
+ * Whether the engine a session runs on draws `Text`'s `mono`: its release (`base`, else `version`) is
+ * 2.1.299 or later. False when there is no version or it is not spelled as one: the line is then drawn
+ * without the face, which only a graphical surface would miss.
+ */
+export const knowsMono = (v: { version?: string; base?: string } | null | undefined): boolean => {
+  const m = /^(\d+)\.(\d+)\.(\d+)/.exec(v?.base ?? v?.version ?? '')
+  if (!m) return false
+  for (let i = 0; i < MONO_SINCE.length; i += 1) {
+    const part = Number(m[i + 1])
+    if (part !== MONO_SINCE[i]) return part > MONO_SINCE[i]!
+  }
+  return true
+}
+
+/** A card whose agent was resumed after it finished (SendMessage): running again, its clock from its first spawn. */
+export const resumeCard = (c: AgentCard): AgentCard => ({ ...c, status: 'running', endedAt: null })
+
+/**
+ * A spawned card joins the list. An id already there is that agent resumed: its card runs again
+ * where it stands, with its tallies and the new task and model, so no two cards share keys.
+ */
+export const addCard = (cards: AgentCard[], card: AgentCard): AgentCard[] =>
+  cards.some(c => c.id === card.id)
+    ? cards.map(c => (c.id === card.id ? resumeCard({ ...c, description: card.description || c.description, model: card.model || c.model }) : c))
+    : [...cards, card].slice(-24)
+
 export const stepLoop = (loops: Loop[], id: string, at: number): Loop[] => {
   const found = loops.find(l => l.id === id)
   const next = found
@@ -461,6 +595,9 @@ export const lanes = (cards: AgentCard[], now: number, width: number) => {
 
 // ---------------------------------------------------------------- layout
 
+/** How many agent cards sit side by side in `width` cells, 20 each and a gap between: at least one, at most `maxCards`. More agents than that draw as swimlanes. */
+export const cardsFit = (width: number, maxCards: number) => Math.max(1, Math.min(maxCards, Math.floor((width + 1) / 21)))
+
 /** How many log lines fit: what the other panels leave, never fewer than 4 nor more than 8. */
 export const logRows = (bodyRows: number, used: number) => Math.max(4, Math.min(8, bodyRows - used - 3))
 
@@ -476,6 +613,31 @@ export const fitLegend = <T extends { label: string }>(items: T[], width: number
   }
   return out
 }
+
+/** The cells a string takes in a terminal: one per character. */
+export const cellWidth = (s: string) => [...s].reduce((n, ch) => n + ((ch.codePointAt(0) ?? 0) > 0x2e7f ? 2 : 1), 0)
+
+/**
+ * How many pieces of a line fit in `room` cells, in order from the start: each piece is `lead` extra cells
+ * then `width`, and pieces sit `gap` cells apart. The rest are left out, as the legend's items are.
+ */
+export const piecesThatFit = (pieces: readonly { width: number; lead?: number }[], room: number, gap: number) => {
+  let used = 0
+  for (let i = 0; i < pieces.length; i += 1) {
+    const p = pieces[i]!
+    const next = used + (i > 0 ? gap : 0) + (p.lead ?? 0) + p.width
+    if (next > room) return i
+    used = next
+  }
+  return pieces.length
+}
+
+/**
+ * How many marks (■ ✗ ● ○ ✓) a row of `cells` columns holds. A terminal draws each mark in one
+ * cell; a graphical surface draws them wider (■ measured about 1.4 cells on the desktop app), so
+ * there a row holds fewer and its newest marks still show.
+ */
+export const marksIn = (cells: number, isTerminal: boolean) => (isTerminal ? cells : Math.floor(cells / 1.5))
 
 /** A card's title row: the task in the agent's own words, the type only when there is none. */
 export const cardTitle = (c: AgentCard) => c.description || c.type
@@ -517,10 +679,10 @@ export const handbackOf = (text: string): { from: string; body: string } | null 
   return body ? { from, body } : null
 }
 
-/** The advice line a pane shows for a report: its first real line, markdown markers stripped, cut to 160. */
+/** The advice line a pane shows for a report: its first real line, credentials masked, markdown markers stripped, cut to 160. */
 export const adviceLine = (report: string) => {
   const first = report.split('\n').map(l => l.trim()).find(l => l && !l.startsWith('[') && !l.startsWith('<')) ?? ''
-  return shorten(first.replace(/\*\*|__/g, '').replace(/^[#>*\s-]+/, ''), 160)
+  return shorten(redact(first).replace(/\*\*|__/g, '').replace(/^[#>*\s-]+/, ''), 160)
 }
 
 export const elapsedOf = (c: AgentCard, now: number) => (c.endedAt ?? now) - c.spawnedAt
